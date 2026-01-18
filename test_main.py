@@ -185,5 +185,144 @@ class TestFileClassification(unittest.TestCase):
         self.assertIsNotNone(statement_type, f"Statement type should be found for {filename}")
 
 
+class TestFileMapping(unittest.TestCase):
+    """Test cases for FileMapping caching system."""
+    
+    def setUp(self):
+        """Set up test fixtures with a temporary cache file."""
+        self.temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
+        self.temp_file.write('{}')
+        self.temp_file.close()
+        
+        from file_mapping import FileMapping
+        self.mapping = FileMapping(cache_file=self.temp_file.name, batch_size=3)
+    
+    def tearDown(self):
+        """Clean up temporary files."""
+        if os.path.exists(self.temp_file.name):
+            os.unlink(self.temp_file.name)
+    
+    def test_set_and_get_classification(self):
+        """Test setting and getting a classification."""
+        self.mapping.set_classification(
+            file_id='test123',
+            file_name='test.pdf',
+            company='chase',
+            statement_type='bank statement',
+            account_info='1234'
+        )
+        
+        result = self.mapping.get_classification('test123', 'test.pdf')
+        self.assertEqual(result, ('chase', 'bank statement', '1234'))
+    
+    def test_batch_save(self):
+        """Test that batch saving works (saves every N files)."""
+        # Set batch_size to 3, so it should save after 3 entries
+        for i in range(2):
+            self.mapping.set_classification(
+                file_id=f'file{i}',
+                file_name=f'test{i}.pdf',
+                company='chase',
+                statement_type='bank statement',
+                account_info=str(i)
+            )
+        
+        # Check pending saves count
+        self.assertEqual(self.mapping._pending_saves, 2)
+        
+        # Add one more to trigger save
+        self.mapping.set_classification(
+            file_id='file2',
+            file_name='test2.pdf',
+            company='chase',
+            statement_type='bank statement',
+            account_info='2'
+        )
+        
+        # After batch save, pending should be 0
+        self.assertEqual(self.mapping._pending_saves, 0)
+    
+    def test_flush(self):
+        """Test manual flush of pending saves."""
+        self.mapping.set_classification(
+            file_id='flush_test',
+            file_name='flush.pdf',
+            company='wells fargo',
+            statement_type='credit card statement',
+            account_info='5678'
+        )
+        
+        self.assertEqual(self.mapping._pending_saves, 1)
+        self.mapping.flush()
+        self.assertEqual(self.mapping._pending_saves, 0)
+    
+    def test_thread_safe_mode(self):
+        """Test enabling thread-safe mode."""
+        self.assertIsNone(self.mapping._lock)
+        self.mapping.set_thread_safe()
+        self.assertIsNotNone(self.mapping._lock)
+    
+    def test_cache_stats(self):
+        """Test cache statistics."""
+        self.mapping.set_classification(
+            file_id='stats1',
+            file_name='stats1.pdf',
+            company='amex',
+            statement_type='credit card statement',
+            account_info='9999',
+            force_save=True
+        )
+        
+        stats = self.mapping.get_cache_stats()
+        self.assertEqual(stats['total_cached_files'], 1)
+        self.assertEqual(stats['classified_files'], 1)
+        self.assertEqual(stats['unclassified_files'], 0)
+
+
+class TestParallelProcessing(unittest.TestCase):
+    """Test cases for parallel processing functionality."""
+    
+    def setUp(self):
+        """Set up test fixtures."""
+        with patch.object(GoogleDriveOrganizer, 'authenticate'):
+            self.organizer = GoogleDriveOrganizer(workers=2)
+            self.organizer.service = Mock()
+            self.organizer.creds = Mock()
+    
+    def test_thread_local_service(self):
+        """Test that thread-local services are created."""
+        with patch('main.build') as mock_build:
+            mock_build.return_value = Mock()
+            
+            # Get service twice - should create one per call in different threads
+            service1 = self.organizer.get_thread_service()
+            self.assertIsNotNone(service1)
+    
+    def test_prefetch_folders(self):
+        """Test pre-fetching destination folders."""
+        mock_response = {
+            'files': [
+                {'id': 'folder1', 'name': 'Chase Freedom'},
+                {'id': 'folder2', 'name': 'Schwab Checking'}
+            ]
+        }
+        self.organizer.service.files().list().execute.return_value = mock_response
+        
+        folders = self.organizer.prefetch_destination_folders('dest_id')
+        
+        self.assertEqual(len(folders), 2)
+        self.assertEqual(self.organizer._dest_folders_cache, folders)
+        self.assertEqual(len(self.organizer._folder_info_cache), 2)
+    
+    def test_cached_folder_info(self):
+        """Test cached folder info retrieval."""
+        # Pre-populate cache
+        self.organizer._folder_info_cache['cached_id'] = {'id': 'cached_id', 'name': 'Cached Folder'}
+        
+        # Should return from cache without API call
+        result = self.organizer.get_cached_folder_info('cached_id')
+        self.assertEqual(result['name'], 'Cached Folder')
+
+
 if __name__ == '__main__':
     unittest.main()
