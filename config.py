@@ -12,7 +12,7 @@ COMPANY_PATTERNS = {
     'citi': ['citi', 'citibank', 'citigroup'],
     'us bank': ['us bank', 'usbank', 'usb'],
     'pnc': ['pnc', 'pnc bank'],
-    'td bank': ['td bank', 'tdbank', 'td'],
+
     'synchrony': ['synchrony', 'synchrony bank'],
     'discover': ['discover', 'discover card'],
     'barclays': ['barclays', 'barclaycard'],
@@ -199,7 +199,9 @@ STATEMENT_PATTERNS = {
     'credit card statement': [
         'credit card statement', 'credit_card_statement', 'card statement', 'credit card bill',
         'card bill', 'credit statement', 'card account statement',
-        'credit account', 'card account'
+        'credit account', 'card account',
+        # AmEx-specific patterns (date-named files are usually card statements)
+        'xxxxx', 'xxxx-xxxxx', 'card ending', 'account ending'
     ],
     'investment statement': [
         'investment statement', 'investment_statement', 'portfolio statement', 'brokerage statement',
@@ -210,7 +212,9 @@ STATEMENT_PATTERNS = {
     'loan statement': [
         'loan statement', 'loan_statement', 'mortgage statement', 'lending statement',
         'loan account', 'mortgage account', 'loan bill', 'mortgage bill',
-        'payment statement', 'loan payment', 'mortgage payment'
+        'payment statement', 'loan payment', 'mortgage payment',
+        # Loan payoff patterns
+        'paid in full', 'payoff', 'loan payoff', 'paid off', 'final payment'
     ],
     'insurance statement': [
         'insurance statement', 'insurance_statement', 'policy statement', 'insurance bill',

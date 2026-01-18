@@ -100,12 +100,21 @@ console = Console()
 class GoogleDriveOrganizer:
     """Main class for organizing Google Drive statements."""
     
-    def __init__(self, credentials_file: str = 'credentials.json', token_file: str = 'token.json'):
+    def __init__(self, credentials_file: str = 'credentials.json', token_file: str = 'token.json', workers: int = 4):
         self.credentials_file = credentials_file
         self.token_file = token_file
         self.service = None
+        self.creds = None  # Store credentials for thread-local services
         self.file_mapping = FileMapping()
         self.processed_tracker = ProcessedFilesTracker()
+        self.workers = workers
+        # Caches to reduce API calls
+        self._dest_folders_cache = None  # Pre-fetched destination folders
+        self._folder_info_cache = {}  # folder_id -> folder_info
+        self._dest_folder_id = None  # Destination folder ID for reuse
+        # Thread-local storage for per-thread API services
+        self._thread_local = threading.local()
+        self._cache_lock = threading.Lock()
         self.authenticate()
     
     def authenticate(self):
@@ -132,8 +141,58 @@ class GoogleDriveOrganizer:
             with open(self.token_file, 'w') as token:
                 token.write(creds.to_json())
         
+        self.creds = creds  # Store for creating thread-local services
         self.service = build('drive', 'v3', credentials=creds)
         console.print("[green]✓ Successfully authenticated with Google Drive[/green]")
+    
+    def get_thread_service(self):
+        """Get a thread-local Google Drive service instance.
+        
+        Each thread needs its own service instance to avoid SSL/connection issues.
+        """
+        if not hasattr(self._thread_local, 'service') or self._thread_local.service is None:
+            # Create a new service instance for this thread
+            self._thread_local.service = build('drive', 'v3', credentials=self.creds)
+        return self._thread_local.service
+    
+    def prefetch_destination_folders(self, dest_folder_id: str) -> List[Dict]:
+        """Pre-fetch all destination folders once to avoid repeated API calls."""
+        if self._dest_folders_cache is not None and self._dest_folder_id == dest_folder_id:
+            return self._dest_folders_cache
+        
+        try:
+            console.print("[dim]Pre-fetching destination folders...[/dim]")
+            results = self.service.files().list(
+                q=f"'{dest_folder_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder'",
+                spaces='drive',
+                fields='files(id, name)'
+            ).execute()
+            self._dest_folders_cache = results.get('files', [])
+            self._dest_folder_id = dest_folder_id
+            
+            # Pre-populate folder info cache
+            for folder in self._dest_folders_cache:
+                self._folder_info_cache[folder['id']] = folder
+            
+            console.print(f"[dim]Cached {len(self._dest_folders_cache)} destination folders[/dim]")
+            return self._dest_folders_cache
+        except HttpError as error:
+            console.print(f"[yellow]Warning: Could not prefetch folders: {error}[/yellow]")
+            return []
+    
+    def get_cached_folder_info(self, folder_id: str) -> Optional[Dict]:
+        """Get folder info from cache or fetch if not cached. Thread-safe."""
+        with self._cache_lock:
+            if folder_id in self._folder_info_cache:
+                return self._folder_info_cache[folder_id]
+        
+        try:
+            folder_info = self.service.files().get(fileId=folder_id, fields='id,name').execute()
+            with self._cache_lock:
+                self._folder_info_cache[folder_id] = folder_info
+            return folder_info
+        except:
+            return None
     
     def find_folder_by_name(self, folder_name: str, parent_id: Optional[str] = None) -> Optional[str]:
         """Find a folder by name and optionally parent folder ID."""
@@ -431,15 +490,22 @@ class GoogleDriveOrganizer:
             console.print(f"[yellow]Warning: Could not extract text from PDF: {e}[/yellow]")
             return ""
     
-    def classify_file(self, file_name: str, file_content: Optional[bytes] = None, file_id: str = None, file_size: str = None) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-        """Classify a file based on filename and optionally content. Returns (company, statement_type, account_info)."""
+    def classify_file(self, file_name: str, file_content: Optional[bytes] = None, file_id: str = None, file_size: str = None, skip_download_on_cache: bool = True) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        """Classify a file based on filename and optionally content. Returns (company, statement_type, account_info).
+        
+        Args:
+            skip_download_on_cache: If True and classification is cached, returns immediately without needing file_content.
+        """
         
         # Check cache first if we have file ID
         if file_id:
             cached_result = self.file_mapping.get_classification(file_id, file_name, file_size)
             if cached_result:
-                console.print(f"[dim]Using cached result for {file_name}[/dim]")
-                return cached_result
+                # If all fields are present or we're skipping download, return cached result
+                company, stmt_type, acct_info = cached_result
+                if skip_download_on_cache or (company and stmt_type):
+                    console.print(f"[dim]Using cached result for {file_name}[/dim]")
+                    return cached_result
         
         company = None
         statement_type = None
@@ -618,13 +684,17 @@ class GoogleDriveOrganizer:
     def find_target_folder(self, dest_folder_id: str, company: str, statement_type: str, account_info: Optional[str]) -> Optional[str]:
         """Find the best matching existing folder for this statement using smart matching."""
         try:
-            # Get all folders in Statements by Account
-            results = self.service.files().list(
-                q=f"'{dest_folder_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder'",
-                spaces='drive',
-                fields='files(id, name)'
-            ).execute()
-            folders = results.get('files', [])
+            # Use pre-fetched folders cache if available
+            if self._dest_folders_cache is not None and self._dest_folder_id == dest_folder_id:
+                folders = self._dest_folders_cache
+            else:
+                # Fallback to API call if cache not available
+                results = self.service.files().list(
+                    q=f"'{dest_folder_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder'",
+                    spaces='drive',
+                    fields='files(id, name)'
+                ).execute()
+                folders = results.get('files', [])
             
             # Extract account digits from account_info if available
             account_digits = None
@@ -779,9 +849,152 @@ class GoogleDriveOrganizer:
             console.print(f"[red]Error finding target folder: {error}[/red]")
             return None
     
+    def _process_single_file(self, file: Dict, dest_folder_id: str, dry_run: bool, duplicate_handling: str) -> Dict:
+        """Process a single file - designed for parallel execution.
+        
+        Returns a dict with: status ('copied', 'skipped', 'unclassified', 'error'), and optional message.
+        Uses thread-local API service to avoid SSL/connection issues.
+        """
+        result = {'status': None, 'message': None, 'file_name': file['name']}
+        
+        try:
+            # Skip non-PDF files
+            if not file['name'].lower().endswith('.pdf'):
+                result['status'] = 'skipped'
+                result['message'] = 'Non-PDF file'
+                return result
+            
+            # First check cache - if cached, we can skip the expensive PDF download
+            cached_result = self.file_mapping.get_classification(
+                file['id'], file['name'], file.get('size')
+            )
+            
+            if cached_result and cached_result[0] and cached_result[1]:
+                # Use cached classification - NO download needed!
+                company, statement_type, account_info = cached_result
+                file_content = None  # Don't download
+            else:
+                # Cache miss - need to download and classify using thread-local service
+                file_content = self._download_file_threadsafe(file['id'])
+                if file_content is None:
+                    result['status'] = 'error'
+                    result['message'] = f"Failed to download: {file['name']}"
+                    return result
+                    
+                company, statement_type, account_info = self.classify_file(
+                    file['name'], 
+                    file_content, 
+                    file_id=file['id'], 
+                    file_size=file.get('size'),
+                    skip_download_on_cache=False
+                )
+            
+            if not company or not statement_type:
+                result['status'] = 'unclassified'
+                result['message'] = f"Could not classify: {file['name']}"
+                return result
+            
+            # Find target folder (uses pre-fetched cache - thread-safe)
+            target_folder_id = self.find_target_folder(dest_folder_id, company, statement_type, account_info)
+            
+            if target_folder_id:
+                if not dry_run:
+                    # Copy with appropriate duplicate handling using thread-local service
+                    check_dupes = duplicate_handling != 'force'
+                    success = self._copy_file_threadsafe(file['id'], target_folder_id, check_duplicates=check_dupes)
+                    result['status'] = 'copied' if success else 'error'
+                else:
+                    # Dry run - use cached folder info (thread-safe)
+                    with self._cache_lock:
+                        folder_info = self._folder_info_cache.get(target_folder_id)
+                    folder_name = folder_info['name'] if folder_info else 'existing folder'
+                    result['status'] = 'copied'
+                    result['message'] = f"Would copy: {file['name']} → {folder_name}/"
+            else:
+                # No existing folder - would create new
+                if dry_run:
+                    clean_type = statement_type.replace(" statement", "").replace("_statement", "")
+                    if account_info:
+                        account_digits = self.get_last_digits(account_info, 4)
+                        folder_path = f"{company}/{clean_type} -{account_digits}"
+                    else:
+                        folder_path = f"{company}/{clean_type}"
+                    result['status'] = 'copied'
+                    result['message'] = f"Would copy: {file['name']} → {folder_path}/ (new folder)"
+                else:
+                    # Create folder and copy - use main thread's service for folder creation
+                    # to avoid race conditions
+                    company_folder_id = self.find_folder_by_name(company, dest_folder_id)
+                    if not company_folder_id:
+                        company_folder_id = self.create_folder(company, dest_folder_id)
+                    if company_folder_id:
+                        success = self._copy_file_threadsafe(file['id'], company_folder_id, check_duplicates=True)
+                        result['status'] = 'copied' if success else 'error'
+                    else:
+                        result['status'] = 'error'
+                        result['message'] = f"Failed to create folder for {company}"
+            
+            return result
+            
+        except Exception as e:
+            result['status'] = 'error'
+            result['message'] = f"Error processing {file['name']}: {e}"
+            return result
+    
+    def _download_file_threadsafe(self, file_id: str) -> Optional[bytes]:
+        """Thread-safe file download using thread-local service."""
+        try:
+            service = self.get_thread_service()
+            request = service.files().get_media(fileId=file_id)
+            file = io.BytesIO()
+            downloader = MediaIoBaseDownload(file, request)
+            
+            done = False
+            while done is False:
+                status, done = downloader.next_chunk()
+            
+            return file.getvalue()
+        except Exception as e:
+            # Don't print errors here - they'll clutter parallel output
+            return None
+    
+    def _copy_file_threadsafe(self, file_id: str, destination_folder_id: str, check_duplicates: bool = True) -> bool:
+        """Thread-safe file copy using thread-local service."""
+        try:
+            service = self.get_thread_service()
+            
+            # Get file metadata
+            file_metadata = service.files().get(fileId=file_id).execute()
+            original_name = file_metadata['name']
+            
+            # Simple duplicate check - just check if same name exists
+            if check_duplicates:
+                query = f"name='{original_name}' and '{destination_folder_id}' in parents and trashed=false"
+                existing = service.files().list(q=query, fields='files(id)').execute()
+                if existing.get('files'):
+                    # File already exists, skip
+                    return True
+            
+            # Copy the file
+            copy_metadata = {
+                'name': original_name,
+                'parents': [destination_folder_id]
+            }
+            
+            service.files().copy(fileId=file_id, body=copy_metadata).execute()
+            console.print(f"[green]✓ Copied: {original_name}[/green]")
+            return True
+            
+        except Exception as e:
+            return False
+
     def organize_statements(self, source_folder_id: str, dest_folder_id: str, dry_run: bool = False, duplicate_handling: str = 'smart') -> Dict:
-        """Organize statements from source folder to destination folder."""
-        console.print(f"\n[bold blue]Starting statement organization...[/bold blue]")
+        """Organize statements from source folder to destination folder.
+        
+        Uses sequential processing (threading causes SSL crashes on macOS) but with
+        optimizations: caching, pre-fetched folders, skip downloads on cache hit.
+        """
+        console.print(f"\n[bold blue]Starting statement organization (optimized sequential mode)...[/bold blue]")
         
         # Get files from source folder (recursively)
         console.print("Searching for files recursively through all subfolders...")
@@ -801,6 +1014,9 @@ class GoogleDriveOrganizer:
         
         console.print(f"File types found: {dict(file_types)}")
         
+        # PRE-FETCH destination folders once (major optimization!)
+        self.prefetch_destination_folders(dest_folder_id)
+        
         # Statistics
         stats = {
             'total_files': len(files),
@@ -811,108 +1027,95 @@ class GoogleDriveOrganizer:
             'unclassified': 0
         }
         
-        # Process each file
+        # Process files sequentially (threading causes SSL crashes on macOS)
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
             console=console
         ) as progress:
             task = progress.add_task("Processing files...", total=len(files))
             
             for file in files:
-                progress.update(task, description=f"Processing: {file['name']}")
+                progress.update(task, description=f"Processing: {file['name'][:40]}...")
                 
                 try:
-                    # Skip non-PDF files for now
+                    # Skip non-PDF files
                     if not file['name'].lower().endswith('.pdf'):
-                        console.print(f"[yellow]Skipping non-PDF file: {file['name']}[/yellow]")
                         stats['skipped'] += 1
                         progress.advance(task)
                         continue
                     
-                    # Download file content for analysis
-                    file_content = self.download_file(file['id'])
-                    
-                    # Classify the file (with caching)
-                    company, statement_type, account_info = self.classify_file(
-                        file['name'], 
-                        file_content, 
-                        file_id=file['id'], 
-                        file_size=file.get('size')
+                    # Check cache first - skip download if cached
+                    cached_result = self.file_mapping.get_classification(
+                        file['id'], file['name'], file.get('size')
                     )
                     
+                    if cached_result and cached_result[0] and cached_result[1]:
+                        # Use cached classification - NO download needed!
+                        company, statement_type, account_info = cached_result
+                    else:
+                        # Cache miss - need to download and classify
+                        file_content = self.download_file(file['id'])
+                        if file_content is None:
+                            stats['errors'] += 1
+                            progress.advance(task)
+                            continue
+                            
+                        company, statement_type, account_info = self.classify_file(
+                            file['name'], 
+                            file_content, 
+                            file_id=file['id'], 
+                            file_size=file.get('size'),
+                            skip_download_on_cache=False
+                        )
+                    
                     if not company or not statement_type:
-                        console.print(f"[yellow]Could not classify: {file['name']}[/yellow]")
                         stats['unclassified'] += 1
                         progress.advance(task)
                         continue
                     
-                    # Find the appropriate existing folder or create new structure
+                    # Find target folder (uses pre-fetched cache)
                     target_folder_id = self.find_target_folder(dest_folder_id, company, statement_type, account_info)
                     
                     if target_folder_id:
-                        # Found existing folder, use it directly
                         if not dry_run:
-                            # Apply duplicate handling strategy
-                            if duplicate_handling == 'skip':
-                                # Skip all duplicates
-                                success = self.copy_file(file['id'], target_folder_id, check_duplicates=True)
-                                if success:
-                                    stats['copied'] += 1
-                                else:
-                                    stats['errors'] += 1
-                            elif duplicate_handling == 'rename':
-                                # Force rename all duplicates
-                                success = self.copy_file(file['id'], target_folder_id, check_duplicates=True)
-                                if success:
-                                    stats['copied'] += 1
-                                else:
-                                    stats['errors'] += 1
-                            elif duplicate_handling == 'force':
-                                # Force copy without duplicate checking
-                                success = self.copy_file(file['id'], target_folder_id, check_duplicates=False)
-                                if success:
-                                    stats['copied'] += 1
-                                else:
-                                    stats['errors'] += 1
-                            else:  # smart (default)
-                                # Use intelligent duplicate detection
-                                success = self.copy_file(file['id'], target_folder_id, check_duplicates=True)
-                                if success:
-                                    stats['copied'] += 1
-                                else:
-                                    stats['errors'] += 1
+                            check_dupes = duplicate_handling != 'force'
+                            success = self.copy_file(file['id'], target_folder_id, check_duplicates=check_dupes)
+                            if success:
+                                stats['copied'] += 1
+                            else:
+                                stats['errors'] += 1
                         else:
-                            # Get folder name for display
-                            try:
-                                folder_info = self.service.files().get(fileId=target_folder_id, fields='name').execute()
-                                folder_name = folder_info['name']
-                                console.print(f"[green]Would copy: {file['name']} → {folder_name}/ (existing folder)[/green]")
-                            except:
-                                console.print(f"[green]Would copy: {file['name']} → existing folder[/green]")
+                            folder_info = self.get_cached_folder_info(target_folder_id)
+                            folder_name = folder_info['name'] if folder_info else 'existing folder'
+                            console.print(f"[green]Would copy: {file['name']} → {folder_name}/[/green]")
                             stats['copied'] += 1
                     else:
-                        # No existing folder found, create new structure
-                        company_folder_id = self.find_folder_by_name(company, dest_folder_id)
-                        if not company_folder_id and not dry_run:
-                            company_folder_id = self.create_folder(company, dest_folder_id)
-                        elif not company_folder_id and dry_run:
-                            console.print(f"[blue]Would create folder: {company}[/blue]")
-                            
-                        # For dry run, show what would happen
+                        # No existing folder - would create new
                         if dry_run:
+                            clean_type = statement_type.replace(" statement", "").replace("_statement", "")
                             if account_info:
-                                clean_type = statement_type.replace(" statement", "").replace("_statement", "")
                                 account_digits = self.get_last_digits(account_info, 4)
                                 folder_path = f"{company}/{clean_type} -{account_digits}"
-                                console.print(f"[blue]Would copy: {file['name']} → {folder_path}/ (new folder)[/blue]")
                             else:
-                                clean_type = statement_type.replace(" statement", "").replace("_statement", "")
                                 folder_path = f"{company}/{clean_type}"
-                                console.print(f"[blue]Would copy: {file['name']} → {folder_path}/[/blue]")
-                            if account_info:
-                                console.print(f"[blue]  Account: {account_info} → Last 4: {self.get_last_digits(account_info, 4)}[/blue]")
+                            console.print(f"[blue]Would copy: {file['name']} → {folder_path}/ (new folder)[/blue]")
                             stats['copied'] += 1
+                        else:
+                            company_folder_id = self.find_folder_by_name(company, dest_folder_id)
+                            if not company_folder_id:
+                                company_folder_id = self.create_folder(company, dest_folder_id)
+                            if company_folder_id:
+                                success = self.copy_file(file['id'], company_folder_id, check_duplicates=True)
+                                if success:
+                                    stats['copied'] += 1
+                                else:
+                                    stats['errors'] += 1
+                            else:
+                                stats['errors'] += 1
                     
                     stats['processed'] += 1
                     
@@ -921,6 +1124,9 @@ class GoogleDriveOrganizer:
                     stats['errors'] += 1
                 
                 progress.advance(task)
+        
+        # Flush any pending cache entries
+        self.file_mapping.flush()
         
         return stats
 
@@ -1216,7 +1422,7 @@ def main(source_folder_id: str, dest_folder_id: str, credentials_file: str, dry_
     
     # Initialize organizer
     try:
-        organizer = GoogleDriveOrganizer(credentials_file)
+        organizer = GoogleDriveOrganizer(credentials_file, workers=workers)
     except Exception as e:
         console.print(f"[red]Failed to initialize: {e}[/red]")
         return 1

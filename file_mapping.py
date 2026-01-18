@@ -12,9 +12,27 @@ from datetime import datetime
 class FileMapping:
     """Manages local file mapping cache for PDF classifications."""
     
-    def __init__(self, cache_file: str = 'file_mapping_cache.json'):
+    def __init__(self, cache_file: str = 'file_mapping_cache.json', batch_size: int = 50):
         self.cache_file = cache_file
         self.cache = self._load_cache()
+        self.batch_size = batch_size
+        self._pending_saves = 0
+        self._lock = None  # Will be set if threading is used
+    
+    def set_thread_safe(self):
+        """Enable thread-safe operations."""
+        import threading
+        self._lock = threading.Lock()
+    
+    def _acquire_lock(self):
+        """Acquire lock if in thread-safe mode."""
+        if self._lock:
+            self._lock.acquire()
+    
+    def _release_lock(self):
+        """Release lock if in thread-safe mode."""
+        if self._lock:
+            self._lock.release()
     
     def _load_cache(self) -> Dict:
         """Load existing cache from file."""
@@ -41,36 +59,59 @@ class FileMapping:
     
     def get_classification(self, file_id: str, file_name: str, file_size: Optional[str] = None) -> Optional[Tuple[str, str, str]]:
         """Get cached classification for a file."""
-        key = self._get_file_key(file_id, file_name, file_size)
-        
-        if key in self.cache:
-            cached = self.cache[key]
-            return (
-                cached.get('company'),
-                cached.get('statement_type'),
-                cached.get('account_info')
-            )
-        
-        return None
+        self._acquire_lock()
+        try:
+            key = self._get_file_key(file_id, file_name, file_size)
+            
+            if key in self.cache:
+                cached = self.cache[key]
+                return (
+                    cached.get('company'),
+                    cached.get('statement_type'),
+                    cached.get('account_info')
+                )
+            
+            return None
+        finally:
+            self._release_lock()
     
     def set_classification(self, file_id: str, file_name: str, company: Optional[str], 
                           statement_type: Optional[str], account_info: Optional[str],
-                          file_size: Optional[str] = None):
-        """Cache classification result for a file."""
-        key = self._get_file_key(file_id, file_name, file_size)
-        
-        self.cache[key] = {
-            'file_id': file_id,
-            'file_name': file_name,
-            'file_size': file_size,
-            'company': company,
-            'statement_type': statement_type,
-            'account_info': account_info,
-            'last_updated': datetime.now().isoformat(),
-            'classification_version': '1.0'  # For future compatibility
-        }
-        
-        self._save_cache()
+                          file_size: Optional[str] = None, force_save: bool = False):
+        """Cache classification result for a file. Uses batch saving for performance."""
+        self._acquire_lock()
+        try:
+            key = self._get_file_key(file_id, file_name, file_size)
+            
+            self.cache[key] = {
+                'file_id': file_id,
+                'file_name': file_name,
+                'file_size': file_size,
+                'company': company,
+                'statement_type': statement_type,
+                'account_info': account_info,
+                'last_updated': datetime.now().isoformat(),
+                'classification_version': '1.0'  # For future compatibility
+            }
+            
+            self._pending_saves += 1
+            
+            # Batch save: only write to disk every batch_size files or if forced
+            if force_save or self._pending_saves >= self.batch_size:
+                self._save_cache()
+                self._pending_saves = 0
+        finally:
+            self._release_lock()
+    
+    def flush(self):
+        """Force save any pending cache entries to disk."""
+        self._acquire_lock()
+        try:
+            if self._pending_saves > 0:
+                self._save_cache()
+                self._pending_saves = 0
+        finally:
+            self._release_lock()
     
     def clear_cache(self):
         """Clear all cached data."""
