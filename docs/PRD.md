@@ -392,24 +392,21 @@ The following features are explicitly **not** included in this version:
 - Add retry logic for API failures
 - Improve cache invalidation strategy
 
-### 9.3 Known Limitations (January 2026)
+### 9.3 Threading & Python Version Notes (January 2026)
 
-#### Threading Not Supported
-**Issue**: Python 3.9 + macOS + Google API SSL causes memory corruption crashes when using `ThreadPoolExecutor` for parallel processing.
+#### Python 3.9 Issue (RESOLVED)
+**Issue**: Python 3.9 + macOS + Google API SSL caused memory corruption crashes with `ThreadPoolExecutor`.
 
-**Root Cause**: The `libssl` library on macOS has thread-safety issues when multiple threads share SSL connections, even with thread-local service instances. Crash signature:
-```
-BUG IN CLIENT OF LIBMALLOC: memory corruption of free block
-Thread crashed in: ssl3_read_bytes -> ssl3_setup_read_buffer
-```
+**Root Cause**: The `libssl` library on macOS had thread-safety issues when multiple threads shared SSL connections.
 
-**Resolution**: Sequential processing is used instead. Performance optimizations compensate:
-- Skip PDF download when classification is cached
-- Pre-fetch destination folders once (not per-file)
-- Batch cache saves (every 50 files, not every file)
-- Cached folder info lookups
+**Resolution**: Upgraded to **Python 3.11** which has improved SSL thread safety. Parallel processing now works correctly with 4 workers.
 
-**Future Fix**: Upgrade to Python 3.10+ or use `multiprocessing` instead of `threading`.
+#### Current Architecture
+- **Python 3.11** with `ThreadPoolExecutor` (4 workers default)
+- Thread-local Google API service instances per worker
+- Thread-safe cache with locking
+- Pre-fetched destination folders
+- Skip PDF download on cache hit
 
 ---
 

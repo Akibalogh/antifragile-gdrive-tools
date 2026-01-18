@@ -991,10 +991,10 @@ class GoogleDriveOrganizer:
     def organize_statements(self, source_folder_id: str, dest_folder_id: str, dry_run: bool = False, duplicate_handling: str = 'smart') -> Dict:
         """Organize statements from source folder to destination folder.
         
-        Uses sequential processing (threading causes SSL crashes on macOS) but with
-        optimizations: caching, pre-fetched folders, skip downloads on cache hit.
+        Uses parallel processing with thread-local API services for speed.
+        Optimizations: caching, pre-fetched folders, skip downloads on cache hit.
         """
-        console.print(f"\n[bold blue]Starting statement organization (optimized sequential mode)...[/bold blue]")
+        console.print(f"\n[bold blue]Starting statement organization (parallel mode, {self.workers} workers)...[/bold blue]")
         
         # Get files from source folder (recursively)
         console.print("Searching for files recursively through all subfolders...")
@@ -1017,6 +1017,9 @@ class GoogleDriveOrganizer:
         # PRE-FETCH destination folders once (major optimization!)
         self.prefetch_destination_folders(dest_folder_id)
         
+        # Enable thread-safe caching
+        self.file_mapping.set_thread_safe()
+        
         # Statistics
         stats = {
             'total_files': len(files),
@@ -1027,7 +1030,7 @@ class GoogleDriveOrganizer:
             'unclassified': 0
         }
         
-        # Process files sequentially (threading causes SSL crashes on macOS)
+        # Process files in parallel with thread-local API services
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -1038,92 +1041,48 @@ class GoogleDriveOrganizer:
         ) as progress:
             task = progress.add_task("Processing files...", total=len(files))
             
-            for file in files:
-                progress.update(task, description=f"Processing: {file['name'][:40]}...")
+            # Use ThreadPoolExecutor for parallel processing
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
+                # Submit all tasks
+                future_to_file = {
+                    executor.submit(
+                        self._process_single_file, 
+                        file, 
+                        dest_folder_id, 
+                        dry_run, 
+                        duplicate_handling
+                    ): file for file in files
+                }
                 
-                try:
-                    # Skip non-PDF files
-                    if not file['name'].lower().endswith('.pdf'):
-                        stats['skipped'] += 1
-                        progress.advance(task)
-                        continue
+                # Process results as they complete
+                for future in concurrent.futures.as_completed(future_to_file):
+                    file = future_to_file[future]
+                    progress.update(task, description=f"Processing: {file['name'][:40]}...")
                     
-                    # Check cache first - skip download if cached
-                    cached_result = self.file_mapping.get_classification(
-                        file['id'], file['name'], file.get('size')
-                    )
-                    
-                    if cached_result and cached_result[0] and cached_result[1]:
-                        # Use cached classification - NO download needed!
-                        company, statement_type, account_info = cached_result
-                    else:
-                        # Cache miss - need to download and classify
-                        file_content = self.download_file(file['id'])
-                        if file_content is None:
+                    try:
+                        result = future.result()
+                        
+                        if result['status'] == 'copied':
+                            stats['copied'] += 1
+                            stats['processed'] += 1
+                            if result['message'] and dry_run:
+                                console.print(f"[green]{result['message']}[/green]")
+                        elif result['status'] == 'skipped':
+                            stats['skipped'] += 1
+                        elif result['status'] == 'unclassified':
+                            stats['unclassified'] += 1
+                            if result['message']:
+                                console.print(f"[yellow]{result['message']}[/yellow]")
+                        elif result['status'] == 'error':
                             stats['errors'] += 1
-                            progress.advance(task)
-                            continue
-                            
-                        company, statement_type, account_info = self.classify_file(
-                            file['name'], 
-                            file_content, 
-                            file_id=file['id'], 
-                            file_size=file.get('size'),
-                            skip_download_on_cache=False
-                        )
+                            if result['message']:
+                                console.print(f"[red]{result['message']}[/red]")
                     
-                    if not company or not statement_type:
-                        stats['unclassified'] += 1
-                        progress.advance(task)
-                        continue
+                    except Exception as e:
+                        console.print(f"[red]Error processing {file['name']}: {e}[/red]")
+                        stats['errors'] += 1
                     
-                    # Find target folder (uses pre-fetched cache)
-                    target_folder_id = self.find_target_folder(dest_folder_id, company, statement_type, account_info)
-                    
-                    if target_folder_id:
-                        if not dry_run:
-                            check_dupes = duplicate_handling != 'force'
-                            success = self.copy_file(file['id'], target_folder_id, check_duplicates=check_dupes)
-                            if success:
-                                stats['copied'] += 1
-                            else:
-                                stats['errors'] += 1
-                        else:
-                            folder_info = self.get_cached_folder_info(target_folder_id)
-                            folder_name = folder_info['name'] if folder_info else 'existing folder'
-                            console.print(f"[green]Would copy: {file['name']} → {folder_name}/[/green]")
-                            stats['copied'] += 1
-                    else:
-                        # No existing folder - would create new
-                        if dry_run:
-                            clean_type = statement_type.replace(" statement", "").replace("_statement", "")
-                            if account_info:
-                                account_digits = self.get_last_digits(account_info, 4)
-                                folder_path = f"{company}/{clean_type} -{account_digits}"
-                            else:
-                                folder_path = f"{company}/{clean_type}"
-                            console.print(f"[blue]Would copy: {file['name']} → {folder_path}/ (new folder)[/blue]")
-                            stats['copied'] += 1
-                        else:
-                            company_folder_id = self.find_folder_by_name(company, dest_folder_id)
-                            if not company_folder_id:
-                                company_folder_id = self.create_folder(company, dest_folder_id)
-                            if company_folder_id:
-                                success = self.copy_file(file['id'], company_folder_id, check_duplicates=True)
-                                if success:
-                                    stats['copied'] += 1
-                                else:
-                                    stats['errors'] += 1
-                            else:
-                                stats['errors'] += 1
-                    
-                    stats['processed'] += 1
-                    
-                except Exception as e:
-                    console.print(f"[red]Error processing {file['name']}: {e}[/red]")
-                    stats['errors'] += 1
-                
-                progress.advance(task)
+                    progress.advance(task)
         
         # Flush any pending cache entries
         self.file_mapping.flush()
